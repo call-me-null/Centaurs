@@ -7,11 +7,11 @@
 1. 进程池：所有粒子按每任务 PARTICLES_PER_TASK(=4) 个切成小任务，交给
    multiprocessing.Pool（默认 40 个进程）动态分配。某个任务跑完，空出的核立刻接下一个。
    任务内所有粒子都被抛出后提前结束。调度采用"长任务优先"：NK、UN 区域先提交。
-2. 天体组合（--bodies）：
+2. 天体组合（--bodies，可同时指定多个）：
      full   : 太阳 + 8 大行星 + 5 颗 IAU 矮行星（Ceres、Pluto、Eris、Haumea、Makemake）
      giants : 太阳 + 4 颗巨行星（对照组）
    Horizons 只在主进程查询一次（完整列表），存成 base_solar_system.bin，所有子进程只读这个文件。
-   giants 组建议用 --source-base 从 full 组的 base 文件中挑选，保证两组巨行星的日心初始状态
+   giants 组的 base 文件自动从 full 组的 base 文件中挑选（或用 --source-base 指定），两组巨行星的日心初始状态
    相同（仅差重新移到质心系时的舍入误差，约 1e-15）。两组使用相同的随机种子，因此同一 pid 的粒子初始 q 完全相同，可逐个配对比较。
 3. 不做碰撞检测：所有天体都视为质点，粒子只有两种去向：
          0 = survived  存活到结束
@@ -40,26 +40,27 @@
 用法
 -----
     # 1) 完整组：查询 Horizons，检查打印出的质量
-    python sso_pool_sim.py build-base --bodies full
-    # 2) 对照组：从完整组的 base 文件挑出太阳 + 4 巨行星（不联网）
-    python sso_pool_sim.py build-base --bodies giants --source-base results_full/base_solar_system.bin
-    # 3) 正式运行（在 tmux 中，防止 SSH 断开时进程被杀），结束后自动合并
+    python centaurs.py build-base --bodies full
+    # 2) 正式运行：两组放进同一个进程池（在 tmux 中运行），每组的任务全部结束后各自自动合并。
+    #    giants 组的 base 文件若不存在，会自动从 results_full 的 base 文件挑选生成（不联网）
     tmux new -s sim
-    nice -n 19 python sso_pool_sim.py run --bodies full
-    nice -n 19 python sso_pool_sim.py run --bodies giants
+    nice -n 19 python centaurs.py run --bodies full giants
     # 手动合并当前已完成的任务（中途查看用）
-    python sso_pool_sim.py merge --bodies full
+    python centaurs.py merge --bodies full giants
+
+多个天体组合共用一个进程池：任务按"长任务优先"混合提交（NK → UN → SU → JS，同一区域内 full 在前），
+一组的长任务还在运行时，空出来的核会立即去算另一组的任务。各组仍写入各自的目录、日志，分别合并。
 
 开跑前的检查
     # 测速：单任务用时 × 1000 ≈ 跑满 1e8 年的用时
-    python sso_pool_sim.py run --t-end 1e5 --dt-out 1e4 --n-per-region 40 --out-dir bench_trace
+    python centaurs.py run --t-end 1e5 --dt-out 1e4 --n-per-region 40 --out-dir bench_trace
     # 续算演练：中途 Ctrl-C，再执行同一命令，应出现 resumed+done
-    python sso_pool_sim.py run --t-end 2e4 --dt-out 100 --n-per-region 8 --out-dir resume_test
+    python centaurs.py run --t-end 2e4 --dt-out 100 --n-per-region 8 --out-dir resume_test
     # 收敛测试（可先缩短 --t-end）：比较三组的去向比例与寿命分布
     #   先把同一个 base_solar_system.bin 复制到各目录，保证初始条件完全一致
-    python sso_pool_sim.py run --integrator trace --n-per-region 40 --t-end 1e7 --out-dir conv_trace
-    python sso_pool_sim.py run --integrator trace --dt 0.006 --n-per-region 40 --t-end 1e7 --out-dir conv_trace_half
-    python sso_pool_sim.py run --integrator ias15 --n-per-region 40 --t-end 1e7 --out-dir conv_ias15
+    python centaurs.py run --integrator trace --n-per-region 40 --t-end 1e7 --out-dir conv_trace
+    python centaurs.py run --integrator trace --dt 0.006 --n-per-region 40 --t-end 1e7 --out-dir conv_trace_half
+    python centaurs.py run --integrator ias15 --n-per-region 40 --t-end 1e7 --out-dir conv_ias15
 
 依赖：rebound >= 4.4（推荐 5.x），numpy，astropy
 """
@@ -74,7 +75,7 @@ import time
 import argparse
 import traceback
 from datetime import datetime
-from multiprocessing import Pool
+from multiprocessing import Pool, get_context
 
 import numpy as np
 import rebound
@@ -180,6 +181,20 @@ def get_label(p, hash_table):
     return hash_table.get(p.hash.value, "?")
 
 
+def _read_labels(path):
+    sim = rebound.Simulation(path)
+    table = make_hash_table(BODY_LABELS)
+    return [get_label(sim.particles[i], table) for i in range(sim.N)]
+
+
+def read_labels_clean(path):
+    """在一个全新的进程（spawn）中读取 base 文件里的天体名称。
+    REBOUND 5.2.2 在同一进程中"保存→释放→读取"后，读回的名称可能是错的，
+    所以名称检查一律放在干净的进程里做。"""
+    with get_context("spawn").Pool(1) as pool:
+        return pool.apply(_read_labels, (path,))
+
+
 def make_hash_table(labels):
     if _HAS_NAME:
         return {}
@@ -226,12 +241,11 @@ def build_base_simulation(cfg, source_base=None):
     wanted = body_labels(cfg)
     if source_base:
         print(f"Deriving base simulation from {source_base} ...")
-        sim = rebound.Simulation(source_base)
-        table = make_hash_table(BODY_LABELS)
-        have = [get_label(sim.particles[i], table) for i in range(sim.N)]
+        have = read_labels_clean(source_base)
         missing = [lb for lb in wanted if lb not in have]
         if missing:
             sys.exit(f"Error: {source_base} does not contain {missing}")
+        sim = rebound.Simulation(source_base)
     else:
         sim = rebound.Simulation()
         sim.units = ("AU", "yr", "Msun")
@@ -243,24 +257,26 @@ def build_base_simulation(cfg, source_base=None):
             if mass is not None:
                 part.m = mass
             set_label(part, label)
+        have = [b[1] for b in BODIES]
         jd = Time(START_DATE.replace(" ", "T"), format="isot", scale="utc").jd
         # 单位为 (AU, yr, Msun) 时时间单位就是"年"，不需要再乘 2π
         sim.t = (jd - 2451545.0) / 365.25
-        table = make_hash_table(BODY_LABELS)
 
-    # 只保留指定天体（倒序删除，不影响前面的索引）
+    # 只保留指定天体（按索引倒序删除，不读取粒子名称）
     for i in range(sim.N - 1, -1, -1):
-        if get_label(sim.particles[i], table) not in wanted:
+        if have[i] not in wanted:
             sim.remove(i)
-    order = [get_label(sim.particles[i], table) for i in range(sim.N)]
-    if order != wanted:
-        sys.exit(f"Error: unexpected body order {order}, expected {wanted}")
+            del have[i]
+    if have != wanted:
+        sys.exit(f"Error: unexpected body order {have}, expected {wanted}")
     # 天体组成变了，系统质心也变了，重新移到质心系（不改变各天体的日心状态）
     sim.move_to_com()
 
     if os.path.exists(p["base"]):
         os.remove(p["base"])
     sim.save_to_file(p["base"])
+    if read_labels_clean(p["base"]) != wanted:            # 在干净进程中复核
+        sys.exit(f"Error: verification of {p['base']} failed")
 
     print(f"Base simulation saved to {p['base']}  (bodies = {cfg['bodies']}, N = {sim.N}, "
           f"t0 = {sim.t:.4f} yr since J2000)")
@@ -312,35 +328,41 @@ def helio_xv(p, sun):
     return (p.x - sun.x, p.y - sun.y, p.z - sun.z, p.vx - sun.vx, p.vy - sun.vy, p.vz - sun.vz)
 
 
-def remove_escapers(sim, events, rmax, hash_table):
+# 测试粒子的识别方式：sim_order[k] = 模拟中第 (N_active + k) 个粒子的 pid。
+# 不依赖 REBOUND 的粒子名称：REBOUND 5.2.2 在同一进程中"保存→释放→读取"后，
+# 读回的名称可能是错的（文件本身正确），因此计算中完全不从文件读回名称。
+def remove_escapers(sim, events, rmax, sim_order):
     removed = 0
     r2 = rmax * rmax
-    for i in range(sim.N - 1, sim.N_active - 1, -1):
+    na = sim.N_active
+    for i in range(sim.N - 1, na - 1, -1):     # 倒序删除，不影响前面的索引
         p = sim.particles[i]
         if p.x * p.x + p.y * p.y + p.z * p.z > r2:
-            events.append((get_label(p, hash_table), FATE_EJECTED, sim.t,
+            events.append((int(sim_order[i - na]), FATE_EJECTED, sim.t,
                            helio_xv(p, sim.particles[0])))
-            sim.remove(i)
+            sim.remove(i)                       # 保持顺序删除，与 sim_order 同步
+            del sim_order[i - na]
             removed += 1
     return removed
 
 
 def apply_events(events, state, col_of, alive):
-    for label, fate, t, xv in events:
-        if label in alive:                      # 同一粒子只记第一次
-            k = col_of[label]
+    for pid, fate, t, xv in events:
+        if pid in alive:                        # 同一粒子只记第一次
+            k = col_of[pid]
             state["fate"][k] = fate
             state["fate_time"][k] = t
             state["fate_xv"][k] = xv            # 被抛出瞬间的日心状态矢量
-            alive.discard(label)
+            alive.discard(pid)
     events.clear()
 
 
-def record_snapshot(sim, state, col_of, j, hash_table):
+def record_snapshot(sim, state, col_of, j, sim_order):
     sun = sim.particles[0]
-    for i in range(sim.N_active, sim.N):
+    na = sim.N_active
+    for i in range(na, sim.N):
         p = sim.particles[i]
-        k = col_of[get_label(p, hash_table)]
+        k = col_of[int(sim_order[i - na])]
         o = p.orbit(primary=sun)                # 显式用日心根数（默认是 Jacobi）
         state["elems"][k, j] = (o.a, o.e, o.inc, o.Omega, o.omega, o.M, o.d)
         state["xv"][k, j] = helio_xv(p, sun)
@@ -402,6 +424,7 @@ def new_task_state(task, cfg, n_snap):
         fate_time=np.full(n, np.nan),
         fate_xv=np.full((n, len(FIELDS_XV)), np.nan),
         snap_done=np.array(0),
+        sim_order=pids.copy(),                  # 模拟中测试粒子的顺序（随粒子移除更新）
         config=np.array(config_json(cfg)),
     )
     return sim, state
@@ -417,6 +440,8 @@ def try_resume(cfg, files):
         j = int(state["snap_done"])
         if j == 0 or abs(sim.t - state["t_out"][j - 1]) > 2 * cfg["dt"] + 1e-6:
             return None, None                   # 两个文件不一致 → 从头算
+        if "sim_order" not in state or len(state["sim_order"]) != sim.N - sim.N_active:
+            return None, None
         return sim, state
     except Exception:
         return None, None
@@ -426,9 +451,6 @@ def integrate_task(task):
     cfg = task["cfg"]
     files = task_files(cfg, task["task_id"])
     n_snap = int(round(cfg["t_end"] / cfg["dt_out"]))
-    labels_all = BODY_LABELS + [tp_label(task["first_pid"] + k) for k in range(task["n"])]
-    hash_table = make_hash_table(labels_all)
-
     sim, state = try_resume(cfg, files)
     resumed = sim is not None
     if not resumed:
@@ -437,8 +459,11 @@ def integrate_task(task):
     events = []
     configure(sim, cfg)
 
-    col_of = {tp_label(pid): k for k, pid in enumerate(state["pid"])}
-    alive = {tp_label(pid) for k, pid in enumerate(state["pid"]) if np.isnan(state["fate_time"][k])}
+    col_of = {int(pid): k for k, pid in enumerate(state["pid"])}
+    alive = {int(pid) for k, pid in enumerate(state["pid"]) if np.isnan(state["fate_time"][k])}
+    sim_order = [int(x) for x in state["sim_order"]]
+    if set(sim_order) != alive:
+        raise RuntimeError("sim_order inconsistent with alive particles")
     exact = 1 if cfg["integrator"] == "ias15" else 0   # 辛积分器不强制落在整点，保持辛性
 
     for j in range(int(state["snap_done"]), n_snap):
@@ -450,18 +475,19 @@ def integrate_task(task):
                 sim.integrate(t_target, exact_finish_time=exact)
                 break
             except rebound.Escape:
-                if remove_escapers(sim, events, cfg["exit_max_distance"], hash_table) == 0:
+                if remove_escapers(sim, events, cfg["exit_max_distance"], sim_order) == 0:
                     raise RuntimeError("Escape raised but no test particle beyond exit distance")
         apply_events(events, state, col_of, alive)
         if alive:
-            record_snapshot(sim, state, col_of, j, hash_table)
+            record_snapshot(sim, state, col_of, j, sim_order)
         state["snap_done"] = np.array(j + 1)
+        state["sim_order"] = np.array(sim_order, dtype=np.int64)
         if (j + 1) % cfg["ckpt_every"] == 0 and j + 1 < n_snap and alive:
             write_checkpoint(sim, state, files)
 
     # 存活粒子
-    for label in alive:
-        k = col_of[label]
+    for pid in alive:
+        k = col_of[pid]
         state["fate"][k] = FATE_SURVIVED
         state["fate_time"][k] = state["t_out"][-1]
         state["fate_xv"][k] = state["xv"][k, -1]
@@ -475,27 +501,28 @@ def integrate_task(task):
 
 def run_task(task):
     """进程池入口：永远返回结果而不抛异常，一个任务出错不影响其它任务。"""
-    tid = task["task_id"]
+    tid, bodies = task["task_id"], task["cfg"]["bodies"]
     files = task_files(task["cfg"], tid)
     if os.path.exists(files["final"]):
-        return tid, "skipped", 0.0, ""
+        return bodies, tid, "skipped", 0.0, ""
     t0 = time.time()
     try:
         resumed = integrate_task(task)
-        return tid, ("resumed+done" if resumed else "done"), time.time() - t0, ""
+        return bodies, tid, ("resumed+done" if resumed else "done"), time.time() - t0, ""
     except Exception:
-        return tid, "ERROR", time.time() - t0, traceback.format_exc()
+        return bodies, tid, "ERROR", time.time() - t0, traceback.format_exc()
 
 
 # =============================================================================
 # 4. 合并结果
 # =============================================================================
-def merge(cfg):
+def merge(cfg, to_file=False):
     p = paths(cfg)
+    lf = [p["log"]] if to_file else []
     pat = re.compile(r"task_(\d+)\.npz$")
     files = sorted(f for f in os.listdir(p["tasks"]) if pat.match(f))
     if not files:
-        log("No finished task files to merge.")
+        log(f"[{cfg['bodies']}] No finished task files to merge.", lf)
         return
     parts = []
     for f in files:
@@ -525,25 +552,22 @@ def merge(cfg):
     save_npz_atomic(p["merged"], merged, compressed=True)
 
     n_exp = sum(run_cfg.get("n_per_region") or r[3] for r in REGIONS)
-    log(f"Merged {len(merged['pid'])}/{n_exp} particles from {len(files)} tasks -> {p['merged']}")
+    log(f"[{cfg['bodies']}] Merged {len(merged['pid'])}/{n_exp} particles from {len(files)} tasks -> {p['merged']}", lf)
     for region in [r[0] for r in REGIONS]:
         m = merged["region"] == region
         if m.any():
             counts = {FATE_NAMES[c]: int(np.sum(merged["fate"][m] == c)) for c in FATE_NAMES}
-            log(f"  {region}: {counts}")
+            log(f"[{cfg['bodies']}]   {region}: {counts}", lf)
 
 
 # =============================================================================
 # 5. 主程序
 # =============================================================================
-_LOG_FILE = None   # 由 main() 设置为 results/run_log.txt
-
-
-def log(msg):
+def log(msg, log_files=()):
     """先写日志文件（只由主进程写入，不会冲突），再打印到终端。"""
     line = f"[{datetime.now():%Y-%m-%d %H:%M:%S}] {msg}"
-    if _LOG_FILE:
-        with open(_LOG_FILE, "a") as fh:
+    for lf in log_files:
+        with open(lf, "a") as fh:
             fh.write(line + "\n")
     try:
         print(line, flush=True)
@@ -596,9 +620,12 @@ def check_config(cfg):
 def parse_args():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("command", nargs="?", default="run", choices=["run", "merge", "build-base"])
-    ap.add_argument("--bodies", default=DEFAULTS["bodies"], choices=sorted(BODY_SETS),
-                    help="full: 太阳+8行星+5矮行星；giants: 太阳+4巨行星")
-    ap.add_argument("--out-dir", default=None, help="默认 results_<bodies>")
+    ap.add_argument("--bodies", nargs="+", default=[DEFAULTS["bodies"]], choices=sorted(BODY_SETS),
+                    help="一个或多个天体组合，如 --bodies full giants（多个组合共用一个进程池）。"
+                         "full: 太阳+8行星+5矮行星；giants: 太阳+4巨行星")
+    ap.add_argument("--out-prefix", default="results",
+                    help="输出目录前缀，目录为 <prefix>_<bodies>（默认 results_full、results_giants）")
+    ap.add_argument("--out-dir", default=None, help="直接指定输出目录（只能配合单个天体组合）")
     ap.add_argument("--source-base", default=None,
                     help="build-base 时从已有的 base 文件挑选天体，不查询 Horizons")
     ap.add_argument("--workers", type=int, default=DEFAULTS["workers"])
@@ -612,64 +639,106 @@ def parse_args():
     return ap.parse_args()
 
 
-def main():
-    args = parse_args()
+def make_cfg(args, bodies):
     cfg = dict(DEFAULTS)
-    cfg.update(bodies=args.bodies, out_dir=args.out_dir or f"results_{args.bodies}", workers=args.workers, particles_per_task=args.particles_per_task,
+    cfg.update(bodies=bodies, out_dir=args.out_dir or f"{args.out_prefix}_{bodies}",
+               workers=args.workers, particles_per_task=args.particles_per_task,
                n_per_region=args.n_per_region, integrator=args.integrator, dt=args.dt,
                t_end=args.t_end, dt_out=args.dt_out, seed=args.seed)
+    return cfg
+
+
+def prepare_set(cfg, args, full_base):
+    """建立/检查一个天体组合的 base 文件和参数，返回 None；有问题时退出。"""
     p = paths(cfg)
-    os.makedirs(p["tasks"], exist_ok=True)
-
-    if args.command == "merge":
-        merge(cfg)
-        return
-
     if args.command == "build-base" or not os.path.exists(p["base"]):
         if existing_task_files(cfg):
             sys.exit(f"Error: '{p['tasks']}' already contains task files; rebuilding the base "
-                     f"simulation would mix different initial conditions. Use another --out-dir.")
-        build_base_simulation(cfg, source_base=args.source_base)
+                     f"simulation would mix different initial conditions. Use another output directory.")
+        source = args.source_base
+        # 非 full 组合：如果 full 组的 base 已存在，就从中挑选，保证初始状态一致且不必联网
+        if source is None and cfg["bodies"] != "full" and full_base and os.path.exists(full_base):
+            source = full_base
+        build_base_simulation(cfg, source_base=source)
     if args.command == "build-base":
         return
 
     # base 文件中的天体必须与 --bodies 一致
-    base_sim = rebound.Simulation(p["base"])
-    table = make_hash_table(BODY_LABELS)
-    base_labels = [get_label(base_sim.particles[i], table) for i in range(base_sim.N)]
+    base_labels = read_labels_clean(p["base"])
     if base_labels != body_labels(cfg):
-        sys.exit(f"Error: {p['base']} contains {base_labels}, but --bodies {cfg['bodies']} "
+        sys.exit(f"Error: {p['base']} contains {base_labels}, but bodies '{cfg['bodies']}' "
                  f"expects {body_labels(cfg)}.")
-    del base_sim
 
     # base 文件的指纹也写进参数：base 被替换后，续算会被拒绝
     cfg["base_sha256"] = file_sha256(p["base"])
     check_config(cfg)
 
-    global _LOG_FILE
-    _LOG_FILE = p["log"]
-    tasks = make_tasks(cfg)
-    n_particles = sum(t["n"] for t in tasks)
-    log("-" * 60)
-    log(f"Start: {len(tasks)} tasks, {n_particles} particles, {cfg['workers']} workers, "
-             f"integrator={cfg['integrator']}, dt={cfg['dt']}, t_end={cfg['t_end']:.3g}, "
-             f"dt_out={cfg['dt_out']:.3g}, rebound {rebound.__version__}")
+
+def main():
+    args = parse_args()
+    sets = list(dict.fromkeys(args.bodies))            # 去重，保持顺序
+    if args.out_dir and len(sets) > 1:
+        sys.exit("Error: --out-dir can only be used with a single --bodies value; use --out-prefix instead.")
+    # full 放在最前：其他组合的 base 文件要从它挑选
+    sets.sort(key=lambda b: b != "full")
+    cfgs = {b: make_cfg(args, b) for b in sets}
+    for cfg in cfgs.values():
+        os.makedirs(paths(cfg)["tasks"], exist_ok=True)
+
+    if args.command == "merge":
+        for cfg in cfgs.values():
+            merge(cfg)
+        return
+
+    full_base = paths(cfgs["full"])["base"] if "full" in cfgs else paths(make_cfg(args, "full"))["base"]
+    if args.out_dir:
+        full_base = args.source_base
+    for cfg in cfgs.values():
+        prepare_set(cfg, args, full_base)
+    if args.command == "build-base":
+        return
+
+    # ---- 所有天体组合的任务放进同一个进程池 ----
+    tasks, remaining, n_err, logs = [], {}, {}, {}
+    for k, (b, cfg) in enumerate(cfgs.items()):
+        ts = make_tasks(cfg)
+        for t in ts:
+            t["set_order"] = k
+        tasks += ts
+        remaining[b], n_err[b] = len(ts), 0
+        logs[b] = [paths(cfg)["log"]]
+        log("-" * 60, logs[b])
+        log(f"[{b}] Start: {len(ts)} tasks, {sum(t['n'] for t in ts)} particles, "
+            f"bodies={body_labels(cfg)}, shared pool of {cfg['workers']} workers with {sets}, "
+            f"integrator={cfg['integrator']}, dt={cfg['dt']}, t_end={cfg['t_end']:.3g}, "
+            f"dt_out={cfg['dt_out']:.3g}, rebound {rebound.__version__}", logs[b])
+
+    # 长任务优先：先按区域（NK → UN → SU → JS），同一区域内 full 在前
+    priority = {r: k for k, r in enumerate(SCHEDULE_ORDER)}
+    tasks.sort(key=lambda t: (priority.get(t["region"], len(priority)), t["set_order"], t["task_id"]))
+    workers = args.workers
+    log(f"Pool: {len(tasks)} tasks in total ({', '.join(f'{b}: {remaining[b]}' for b in sets)}), "
+        f"{workers} workers")
 
     t0 = time.time()
-    n_done = n_err = 0
+    n_done = 0
     # maxtasksperchild=1：每个任务用全新进程，避免长时间运行的内存累积
-    with Pool(processes=cfg["workers"], maxtasksperchild=1) as pool:
-        for tid, status, dt, err in pool.imap_unordered(run_task, tasks, chunksize=1):
+    with Pool(processes=workers, maxtasksperchild=1) as pool:
+        for b, tid, status, dt, err in pool.imap_unordered(run_task, tasks, chunksize=1):
             n_done += 1
+            remaining[b] -= 1
             if status == "ERROR":
-                n_err += 1
-                log(f"task {tid:05d} ERROR after {fmt_dt(dt)}:\n{err}")
+                n_err[b] += 1
+                log(f"[{b}] task {tid:05d} ERROR after {fmt_dt(dt)}:\n{err}", logs[b])
             elif status != "skipped":
-                log(f"task {tid:05d} {status} in {fmt_dt(dt)}  ({n_done}/{len(tasks)}, "
-                         f"elapsed {fmt_dt(time.time() - t0)})")
+                log(f"[{b}] task {tid:05d} {status} in {fmt_dt(dt)}  "
+                    f"({n_done}/{len(tasks)}, elapsed {fmt_dt(time.time() - t0)})", logs[b])
+            if remaining[b] == 0:
+                # 这个天体组合的任务全部结束：立即合并（其他组合的任务继续在进程池中运行）
+                log(f"[{b}] All tasks finished in {fmt_dt(time.time() - t0)}; errors: {n_err[b]}", logs[b])
+                merge(cfgs[b], to_file=True)
 
-    log(f"All tasks finished in {fmt_dt(time.time() - t0)}; errors: {n_err}")
-    merge(cfg)
+    log(f"All body sets finished in {fmt_dt(time.time() - t0)}")
 
 
 if __name__ == "__main__":
