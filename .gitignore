@@ -1,0 +1,37 @@
+# ===== 计算结果（体积大，不放进 git） =====
+results_*/
+bench_*/
+conv_*/
+resume_test/
+test_run/
+
+# 数据文件与 checkpoint
+*.npz
+*.bin
+*.tmp
+*.ckpt.bin
+
+# 日志
+run_log.txt
+*.log
+
+# 如果想把初始天体状态纳入版本管理（文件很小，有利于复现），用强制添加：
+#   git add -f results_full/base_solar_system.bin results_giants/base_solar_system.bin
+# 强制添加后的文件会被 git 继续跟踪，不受上面规则影响。
+
+# ===== Python =====
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+.ipynb_checkpoints/
+
+# ===== 编辑器 / 系统 =====
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
