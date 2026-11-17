@@ -113,8 +113,8 @@ DEFAULTS = dict(
     integrator="trace",
     dt=0.012,            # 年；约为水星周期的 1/20。trace/mercurius 才用
     t_end=5e7,           # 积分总时长（年，从起始历元算起）
-    dt_out=1e5,          # 快照间隔（年）
-    ckpt_every=10,       # 每多少个快照写一次 checkpoint（10 × 1e5 年 = 1e6 年，约 15 分钟）
+    dt_out=1e4,          # 快照间隔（年）
+    ckpt_every=100,       # 每多少个快照写一次 checkpoint（10 × 1e5 年 = 1e6 年，约 15 分钟）
     exit_max_distance=1000.0,   # AU，超过即视为被抛出
     Q=40.0,              # 远日距
     inc=0.05,            # rad
