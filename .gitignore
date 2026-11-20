@@ -4,6 +4,7 @@ bench_*/
 conv_*/
 resume_test/
 test_run/
+exact/
 
 # 数据文件与 checkpoint
 *.npz
@@ -28,6 +29,9 @@ dist/
 .venv/
 venv/
 .ipynb_checkpoints/
+*.ipynb
+*.part
+*.pdf
 
 # ===== 编辑器 / 系统 =====
 .vscode/
