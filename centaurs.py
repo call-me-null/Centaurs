@@ -275,32 +275,47 @@ def query_horizons(path, bodies, start_date):
     print(f"Saved {path}  (N = {sim.N}, t0 = {sim.t:.4f} yr since J2000)")
 
 
-def derive_base(src, dst, wanted, all_labels, tag):
-    """从完整的 base 文件中挑出 wanted 中的天体，移到新的质心系后存为 dst。"""
-    have = read_labels_clean(src, all_labels)          # 名称在干净进程中读取
-    missing = [lb for lb in wanted if lb not in have]
-    if missing:
-        sys.exit(f"Error: {src} does not contain {missing}")
+def _derive_worker(src, dst, have, wanted):
+    """在全新进程中执行：读取完整的 base 文件，删去不需要的天体，移到新的质心系后保存。
+    天体按 have（在干净进程中读出的名称列表）的位置删除，不读取粒子名称。"""
+    have = list(have)
     sim = rebound.Simulation(src)
-    for i in range(sim.N - 1, -1, -1):                 # 按索引倒序删除，不读取粒子名称
+    for i in range(sim.N - 1, -1, -1):                 # 按索引倒序删除
         if have[i] not in wanted:
             sim.remove(i)
             del have[i]
     if have != list(wanted):
-        sys.exit(f"Error: unexpected body order {have}, expected {list(wanted)}")
+        return None, have
     # 天体组成变了，系统质心也变了，重新移到质心系（不改变各天体的日心状态）
     sim.move_to_com()
     if os.path.exists(dst):
         os.remove(dst)
     sim.save_to_file(dst)
+    info = []
+    for i in range(sim.N):
+        p = sim.particles[i]
+        info.append((p.m, p.orbit(primary=sim.particles[0]).a if i else 0.0))
+    return info, have
+
+
+def derive_base(src, dst, wanted, all_labels, tag):
+    """从完整的 base 文件中挑出 wanted 中的天体，存为 dst。
+    REBOUND 5.2.2 在同一进程中"保存→释放→读取"后，读回的粒子名称会出错，
+    而这里读取后又要保存，错误的名称会被写进新文件。因此读取和保存都放在全新的进程（spawn）中做。"""
+    have = read_labels_clean(src, all_labels)          # 名称在干净进程中读取
+    missing = [lb for lb in wanted if lb not in have]
+    if missing:
+        sys.exit(f"Error: {src} does not contain {missing}")
+    with get_context("spawn").Pool(1) as pool:
+        info, got = pool.apply(_derive_worker, (src, dst, have, list(wanted)))
+    if info is None:
+        sys.exit(f"Error: unexpected body order {got}, expected {list(wanted)}")
     if read_labels_clean(dst, all_labels) != list(wanted):
         sys.exit(f"Error: verification of {dst} failed")
-    print(f"[{tag}] base saved to {dst}  (N = {sim.N})")
-    for i, label in enumerate(wanted):
-        part = sim.particles[i]
-        a = part.orbit(primary=sim.particles[0]).a if i else 0.0
-        print(f"    {label:9s} m = {part.m:.4e} Msun   a_helio = {a:.4f} AU")
-        if part.m == 0:
+    print(f"[{tag}] base saved to {dst}  (N = {len(info)})")
+    for label, (m, a) in zip(wanted, info):
+        print(f"    {label:9s} m = {m:.4e} Msun   a_helio = {a:.4f} AU")
+        if m == 0:
             print(f"    WARNING: {label} has zero mass!")
 
 
